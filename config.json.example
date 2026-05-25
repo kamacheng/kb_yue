@@ -1,0 +1,7 @@
+{
+  "_comment_kb_root": "知识库根目录的绝对路径。该目录下应包含 original_file/ 与 md_file/ 子目录。",
+  "kb_root": "D:/你的知识库路径",
+
+  "_comment_data_dir": "可选。索引数据目录（向量库、缓存、法典等）。留空则默认 <kb_root>/.kb_index",
+  "data_dir": ""
+}
