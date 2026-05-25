@@ -58,11 +58,11 @@ def _load_config() -> dict:
             pass
 
     kb_root_from_config = config.get("kb_root")
-    kb_root = kb_root_from_config or os.environ.get("KB_ROOT")
+    kb_root = kb_root_from_config or get_env("KB_ROOT")
     if not kb_root:
         raise RuntimeError(
-            "未配置知识库路径。请在 config.json 中设置 kb_root，"
-            "或设置环境变量 KB_ROOT。详见 README。"
+            "未配置知识库路径。请在 .env 文件中设置 KB_ROOT，"
+            "或在 config.json 中设置 kb_root。详见 README。"
         )
 
     # 若 kb_root 来自 config.json 且为相对路径，相对于 config.json 目录解析
@@ -70,7 +70,7 @@ def _load_config() -> dict:
     if kb_root_from_config:
         kb_root = _resolve_kb_root(kb_root, config_path)
 
-    data_dir = config.get("data_dir") or os.environ.get("KB_DATA_DIR")
+    data_dir = config.get("data_dir") or get_env("KB_DATA_DIR")
     if not data_dir or data_dir.startswith("可选"):
         data_dir = str(Path(kb_root) / ".kb_index")
 

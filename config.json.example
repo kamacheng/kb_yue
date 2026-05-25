@@ -1,7 +1,8 @@
 {
-  "_comment_kb_root": "知识库根目录的绝对路径。该目录下应包含 original_file/ 与 md_file/ 子目录。",
+  "_comment": "本文件是可选的，推荐使用 .env 配置 KB_ROOT（可直接粘贴 Windows 单反斜杠路径）。",
+  "_comment_path": "如果一定要用 JSON 配置，Windows 路径必须用正斜杠 / 或双反斜杠 \\\\。单反斜杠会触发 JSON 转义错误。",
   "kb_root": "D:/你的知识库路径",
 
-  "_comment_data_dir": "可选。索引数据目录（向量库、缓存、法典等）。留空则默认 <kb_root>/.kb_index",
+  "_comment_data_dir": "可选。索引数据目录。留空则默认 <kb_root>/.kb_index",
   "data_dir": ""
 }

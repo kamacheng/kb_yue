@@ -27,14 +27,16 @@ cd kb_yue
 # 2. 安装依赖
 pip install -r requirements.txt
 
-# 3. 配置 API key
+# 3. 配置 API key + 知识库路径（推荐方式）
 cp .env.example .env
-# 编辑 .env，填入你自己的 SILICONFLOW_API_KEY 和 DEEPSEEK_API_KEY
-
-# 4. 配置知识库路径
-cp config.json.example config.json
-# 编辑 config.json，把 kb_root 改成你自己知识库根目录的绝对路径
+# 编辑 .env，填入：
+#   - SILICONFLOW_API_KEY
+#   - DEEPSEEK_API_KEY
+#   - KB_ROOT（你的知识库根目录，绝对路径，Windows 单反斜杠可直接粘贴）
 ```
+
+> **可选**：如果你想用 JSON 管理路径，复制 `config.json.example` 为 `config.json` 即可。
+> 注意：JSON 中的 Windows 路径必须用 `/` 或 `\\`，单反斜杠会触发 JSON 解析错误。
 
 ### 准备你的知识库
 
@@ -127,7 +129,10 @@ kb_yue/
 A：确认 `.env` 文件已从 `.env.example` 复制并填好真实 key；`.env` 必须与 `server.py` 在同一目录。
 
 **Q：报错 `未配置知识库路径`？**
-A：确认 `config.json` 已从 `config.json.example` 复制，并把 `kb_root` 改成绝对路径。
+A：确认 `.env` 文件已从 `.env.example` 复制，并填了 `KB_ROOT=<你的绝对路径>`。或者在 `config.json` 里设置 `kb_root`。
+
+**Q：JSON 配置中粘贴 Windows 路径报错？**
+A：JSON 不允许单反斜杠（`\t` `\n` 等会被当成转义符）。请改用 `.env` 配置（不需要转义），或在 JSON 里把 `\` 全部替换为 `/` 或 `\\`。
 
 **Q：索引很慢 / 经常超时？**
 A：首次全量索引会调用大量 LLM API，受网络和限流影响。可减小并发（修改 `config.py` 中 `LLM_API_SEMAPHORE` 的值）或分批处理。
