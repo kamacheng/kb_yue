@@ -72,7 +72,7 @@ cp .env.example .env
 
 ### 首次建立索引
 
-接入 MCP 后，让 Claude 调用 `kb_rebuild` 工具做一次全量索引（耗时取决于文档量）。之后用 `kb_update`（增量）即可。
+接入 MCP 后，让 Claude 调用 `kb_index` 工具（`mode="full"`）做一次全量索引（耗时取决于文档量）。之后用 `mode="incremental"` 增量更新即可。
 
 ---
 
@@ -84,15 +84,35 @@ cp .env.example .env
 | `kb_list_modules` | 列出所有模块和文档 |
 | `kb_get_document` | 获取指定文档全文 |
 | `kb_get_module_relations` | 查看模块间依赖关系 |
-| `kb_get_related_designs` | 找出与某文档相关的其他设计 |
+| `kb_get_related_designs` | 找出与某模块相关的其他设计 |
 | `kb_check` | 检查设计内容是否符合法典 / 与事实一致 |
-| `kb_audit` | 全面体检知识库（冲突 + 一致性） |
-| `kb_canon` | 管理法典规则 |
-| `kb_index` | 索引知识库（incremental / full / single） |
-| `kb_overview` | 统计 / 变更 / 覆盖盲区 |
-| `kb_draft_assist` | 辅助起草新设计文档 |
+| `kb_audit` | 全面体检知识库（跨文档矛盾） |
+| `kb_canon` | 管理法典规则（查看/状态/导出/同步/解决冲突） |
+| `kb_index` | 索引知识库（incremental / full / single / cleanup） |
+| `kb_preview_facts` | 预览单文档的事实提取结果（不写入） |
+| `kb_overview` | 统计 / 最近变更 / 处理状态盲区 |
+| `kb_draft_assist` | 辅助起草新设计文档（收集素材+法典约束） |
 
 详见 `server.py` 中各工具的 docstring。
+
+## 配套 Slash 命令
+
+仓库的 `.claude/commands/` 下提供了与每个工具一一对应的 slash 命令，clone 后在 Claude Code 中可直接使用：
+
+```
+/kb_search <关键词>           — 搜索文档/事实
+/kb_list_modules             — 列出模块
+/kb_get_document <路径>       — 读取文档全文
+/kb_get_module_relations     — 模块关系图
+/kb_get_related_designs <模块> — 关联设计
+/kb_index [mode]             — 索引管理
+/kb_preview_facts <路径>      — 预览事实提取
+/kb_check <内容>              — 合规+一致性检查
+/kb_audit [模块]              — 跨文档矛盾审计
+/kb_canon [action]           — 法典管理
+/kb_overview [view]          — 概览（stats/changes/gaps）
+/kb_draft_assist <主题>       — 起草素材收集
+```
 
 ---
 
