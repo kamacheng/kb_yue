@@ -41,15 +41,72 @@ class CleanedSheet:
 
 # ---------- 合并单元格处理 ----------
 
-def _unmerge_and_fill(ws) -> None:
-    """取消合并单元格并用左上角值填充。"""
+def _unmerge_and_fill(ws) -> list[tuple[int, int, int, int]]:
+    """取消合并单元格并用左上角值填充,返回原合并区域列表 (min_row, min_col, max_row, max_col),1-based。"""
+    ranges: list[tuple[int, int, int, int]] = []
     for merge_range in list(ws.merged_cells.ranges):
         min_row, min_col = merge_range.min_row, merge_range.min_col
+        max_row, max_col = merge_range.max_row, merge_range.max_col
         top_left_value = ws.cell(row=min_row, column=min_col).value
+        ranges.append((min_row, min_col, max_row, max_col))
         ws.unmerge_cells(str(merge_range))
-        for row in range(merge_range.min_row, merge_range.max_row + 1):
-            for col in range(merge_range.min_col, merge_range.max_col + 1):
+        for row in range(min_row, max_row + 1):
+            for col in range(min_col, max_col + 1):
                 ws.cell(row=row, column=col).value = top_left_value
+    return ranges
+
+
+def _translate_merged_ranges(
+    ranges_1based: list[tuple[int, int, int, int]],
+    kept_cols: list[int],
+    result_indices: list[int],
+) -> list[tuple[int, int, int, int]]:
+    """把 openpyxl 1-based 合并区域映射到 _clean_rows 之后的 0-based 坐标。
+
+    被 _clean_rows 丢弃的行/列从合并区域内剔除,只保留与清洗后区域的交集。
+    交集为空时该合并被丢掉。
+    """
+    if not ranges_1based:
+        return []
+    col_map = {orig: idx for idx, orig in enumerate(kept_cols)}
+    row_map = {orig: idx for idx, orig in enumerate(result_indices)}
+    out: list[tuple[int, int, int, int]] = []
+    for r0, c0, r1, c1 in ranges_1based:
+        rows_in = [row_map[r] for r in range(r0 - 1, r1) if r in row_map]
+        cols_in = [col_map[c] for c in range(c0 - 1, c1) if c in col_map]
+        if rows_in and cols_in:
+            out.append((min(rows_in), min(cols_in), max(rows_in), max(cols_in)))
+    return out
+
+
+def _collapse_row_by_merges(
+    row_idx: int,
+    row: list[str],
+    merged_ranges: list[tuple[int, int, int, int]],
+) -> list[str]:
+    """根据合并区域折叠一行:覆盖此行且跨列的合并只输出一次(起始列处),其余列方向重复值跳过。
+
+    行方向合并(c1 == c0)不折叠,保持每行有值的现状。
+    """
+    if not merged_ranges:
+        return list(row)
+    col_merges: dict[int, int] = {}
+    for r0, c0, r1, c1 in merged_ranges:
+        if r0 <= row_idx <= r1 and c1 > c0:
+            col_merges[c0] = max(col_merges.get(c0, c0), c1)
+    if not col_merges:
+        return list(row)
+    result: list[str] = []
+    skip_until = -1
+    for col_idx, cell in enumerate(row):
+        if col_idx <= skip_until:
+            continue
+        if col_idx in col_merges:
+            result.append(cell)
+            skip_until = col_merges[col_idx]
+        else:
+            result.append(cell)
+    return result
 
 
 # ---------- 图片提取 ----------
@@ -300,13 +357,16 @@ def _build_image_map(rows, images, orig_row_indices, sheet_name):
 # ---------- 内容格式化 ----------
 
 def _hierarchical_text(rows: list[list[str]], orig_cols: list[int],
-                       images=None, orig_row_indices=None, sheet_name="") -> str:
+                       images=None, orig_row_indices=None, sheet_name="",
+                       merged_ranges=None) -> str:
     """利用原始列索引推断层级结构。
 
     原始列索引越大 → 层级越深 → 输出 2空格缩进。
     """
     if not rows:
         return ""
+
+    merged_ranges = merged_ranges or []
 
     # 收集所有出现过内容的原始列索引
     used_orig_cols: set[int] = set()
@@ -336,16 +396,18 @@ def _hierarchical_text(rows: list[list[str]], orig_cols: list[int],
                 lines.append("")
             continue
 
-        # 找第一个非空单元格确定层级
+        # 层级判定基于原始列,要在折叠前用 row 找首个非空
         first_orig_col = None
-        parts: list[str] = []
         for i, cell in enumerate(row):
             if cell and i < len(orig_cols):
-                if first_orig_col is None:
-                    first_orig_col = orig_cols[i]
-                parts.append(cell)
+                first_orig_col = orig_cols[i]
+                break
 
-        if not parts:
+        # 折叠列方向合并后再拼接,避免重复内容
+        collapsed = _collapse_row_by_merges(row_idx, row, merged_ranges)
+        parts = [c for c in collapsed if c]
+
+        if not parts or first_orig_col is None:
             continue
 
         level = col_to_level.get(first_orig_col, 0)
@@ -361,8 +423,10 @@ def _hierarchical_text(rows: list[list[str]], orig_cols: list[int],
 
 
 def _markdown_table(rows: list[list[str]],
-                    images=None, orig_row_indices=None, sheet_name="") -> str:
+                    images=None, orig_row_indices=None, sheet_name="",
+                    merged_ranges=None) -> str:
     """格式化为干净的 Markdown 表格。"""
+    merged_ranges = merged_ranges or []
     non_empty_rows = []
     non_empty_cleaned_indices = []
     for ci, r in enumerate(rows):
@@ -373,11 +437,18 @@ def _markdown_table(rows: list[list[str]],
     if not non_empty_rows:
         return ""
 
-    # 图片占位符映射
+    # 图片占位符映射(基于折叠前的行索引)
     img_after = _build_image_map(rows, images, orig_row_indices, sheet_name)
 
-    max_cols = max(len(r) for r in non_empty_rows)
-    normalized = [r + [""] * (max_cols - len(r)) for r in non_empty_rows]
+    # 按列方向合并折叠每行,然后用行的最大列数对齐
+    collapsed_rows = [
+        _collapse_row_by_merges(ci, r, merged_ranges)
+        for ci, r in zip(non_empty_cleaned_indices, non_empty_rows)
+    ]
+    max_cols = max(len(r) for r in collapsed_rows)
+    if max_cols == 0:
+        return ""
+    normalized = [r + [""] * (max_cols - len(r)) for r in collapsed_rows]
 
     lines = []
 
@@ -405,7 +476,7 @@ def _markdown_table(rows: list[list[str]],
 
 def preprocess_sheet(ws, sheet_name: str) -> CleanedSheet:
     """预处理单个 worksheet。"""
-    _unmerge_and_fill(ws)
+    merged_1based = _unmerge_and_fill(ws)
     raw = _read_raw(ws)
     images = _extract_images(ws)
 
@@ -413,12 +484,15 @@ def preprocess_sheet(ws, sheet_name: str) -> CleanedSheet:
         return CleanedSheet(sheet_name, SheetType.DOCUMENT, "*(空表)*", 0, 5, images)
 
     cleaned, orig_cols, orig_row_indices = _clean_rows(raw)
+    merged_cleaned = _translate_merged_ranges(merged_1based, orig_cols, orig_row_indices)
     sheet_type = _detect_type(sheet_name, cleaned)
 
     if sheet_type in (SheetType.DATA_TABLE, SheetType.CONFIG_TABLE, SheetType.ENUM_TABLE):
-        content = _markdown_table(cleaned, images, orig_row_indices, sheet_name)
+        content = _markdown_table(cleaned, images, orig_row_indices, sheet_name,
+                                  merged_ranges=merged_cleaned)
     else:
-        content = _hierarchical_text(cleaned, orig_cols, images, orig_row_indices, sheet_name)
+        content = _hierarchical_text(cleaned, orig_cols, images, orig_row_indices, sheet_name,
+                                     merged_ranges=merged_cleaned)
 
     row_count = sum(1 for r in cleaned if any(r))
     estimated_tokens = len(content) // 2

@@ -1,4 +1,4 @@
-# kb_yue — 游戏设计知识库 MCP Server
+# kb_yue —  MCP Server
 
 一个基于 [Model Context Protocol](https://modelcontextprotocol.io/) 的知识库服务，为 Claude Code / Cursor / 其他 MCP 客户端提供：
 
@@ -7,6 +7,8 @@
 - **法典层**：把团队约定固化成规则，对新内容做合规检查
 - **文档管理**：模块化组织、关系图谱、增量索引、文件监听
 
+> 不论你是想查询知识库（只读使用者）还是维护知识库（写入维护者），**安装方式完全一致**。差别只在「同步哪些子目录」和「能用哪些工具」，见下文。
+
 ---
 
 ## 快速开始
@@ -14,46 +16,34 @@
 ### 前置条件
 
 - Python 3.10+
-- SiliconFlow 账号（用于向量嵌入 + Reranker）：[申请 API Key](https://cloud.siliconflow.cn/account/ak)
-- DeepSeek 账号（用于事实抽取/AI 格式化）：[申请 API Key](https://platform.deepseek.com/api_keys)
+- SiliconFlow 账号（向量嵌入 + Reranker）：[申请 API Key](https://cloud.siliconflow.cn/account/ak)
+- DeepSeek 账号（事实抽取 / AI 格式化）：[申请 API Key](https://platform.deepseek.com/api_keys)
 
 ### 安装
 
 ```bash
-# 1. 克隆本仓库
 git clone https://github.com/kamacheng/kb_yue.git
 cd kb_yue
-
-# 2. 安装依赖
 pip install -r requirements.txt
-
-# 3. 配置 API key + 知识库路径（推荐方式）
 cp .env.example .env
-# 编辑 .env，填入：
-#   - SILICONFLOW_API_KEY
-#   - DEEPSEEK_API_KEY
-#   - KB_ROOT（你的知识库根目录，绝对路径，Windows 单反斜杠可直接粘贴）
+# 编辑 .env：填入 SILICONFLOW_API_KEY、DEEPSEEK_API_KEY、KB_ROOT
 ```
 
-> **可选**：如果你想用 JSON 管理路径，复制 `config.json.example` 为 `config.json` 即可。
-> 注意：JSON 中的 Windows 路径必须用 `/` 或 `\\`，单反斜杠会触发 JSON 解析错误。
-
-### 准备你的知识库
-
-`kb_root` 指向的目录建议有如下结构：
+### KB_ROOT 目录约定
 
 ```
-<你的知识库根目录>/
-├─ original_file/      ← 原始文档（.docx / .xlsx / .pdf / .md 等）
-├─ md_file/            ← 转化后的 Markdown（流程产物，可由工具生成）
-└─ .kb_index/          ← 自动生成，存放向量库、事实库、法典等运行时数据
+<KB_ROOT>/
+├─ md_file/            ← 转化后的 Markdown（查询/读取的内容来源）        【必需】
+├─ .kb_index/          ← 索引/事实/法典数据（运行时自动生成或同步获得）   【必需】
+└─ original_file/      ← 原始 docx/xlsx/pdf（仅建索引时需要）             【仅维护者】
 ```
 
-`original_file/` 和 `md_file/` 的目录约定可参考 `doc_parser.py` 与 `xlsx_converter.py` 中的处理逻辑。
+- **只读使用者**：让维护者把 `md_file/` 和 `.kb_index/` 同步给你即可，原始文档不用拉。
+- **维护者**：三件套齐全。建议在 `.gitignore` 中忽略 `original_file/`（体积大、不便 diff，只读者也不需要）。
 
-### 在 MCP 客户端中接入
+### 接入 MCP 客户端
 
-以 Claude Code 为例，在你的工作目录的 `.mcp.json` 中加入：
+以 Claude Code 为例，工作目录的 `.mcp.json` 加入：
 
 ```json
 {
@@ -66,57 +56,70 @@ cp .env.example .env
 }
 ```
 
-> 将 `D:/_pro/kb_yue/server.py` 替换为你克隆本仓库后的实际绝对路径。
-> 如果系统里 `python` 不在 PATH，请把 `command` 写成 Python 解释器的完整路径，例如：
-> `C:/Users/<你>/AppData/Local/Programs/Python/Python312/python.exe`
-
-### 首次建立索引
-
-接入 MCP 后，让 Claude 调用 `kb_index` 工具（`mode="full"`）做一次全量索引（耗时取决于文档量）。之后用 `mode="incremental"` 增量更新即可。
+> 路径换成你实际 clone mcp-server的位置。若 `python` 不在 PATH，把 `command` 写成解释器完整路径。
 
 ---
 
-## 提供的工具
+## 工具一览
 
-| 工具 | 用途 |
-|---|---|
-| `kb_search` | 语义搜索文档 / 事实 |
-| `kb_list_modules` | 列出所有模块和文档 |
-| `kb_get_document` | 获取指定文档全文 |
-| `kb_get_module_relations` | 查看模块间依赖关系 |
-| `kb_get_related_designs` | 找出与某模块相关的其他设计 |
-| `kb_check` | 检查设计内容是否符合法典 / 与事实一致 |
-| `kb_audit` | 全面体检知识库（跨文档矛盾） |
-| `kb_canon` | 管理法典规则（查看/状态/导出/同步/解决冲突） |
-| `kb_index` | 索引知识库（incremental / full / single / cleanup） |
-| `kb_preview_facts` | 预览单文档的事实提取结果（不写入） |
-| `kb_overview` | 统计 / 最近变更 / 处理状态盲区 |
-| `kb_draft_assist` | 辅助起草新设计文档（收集素材+法典约束） |
+| 工具 | 用途 | 角色 |
+| --- | --- | --- |
+| `kb_search` | 混合语义搜索文档 / 事实 | 读 |
+| `kb_list_modules` | 列出所有模块和文档 | 读 |
+| `kb_get_document` | 获取指定文档全文 | 读 |
+| `kb_get_module_relations` | 查看模块间依赖关系 | 读 |
+| `kb_get_related_designs` | 找出与某模块相关的其他设计 | 读 |
+| `kb_overview` | 统计 / 最近变更 / 处理状态盲区 | 读 |
+| `kb_check` | 检查内容是否符合法典 / 与事实一致 | 读 |
+| `kb_audit` | 全面体检知识库（跨文档矛盾） | 读 |
+| `kb_draft_assist` | 起草新设计前收集素材+法典约束 | 读 |
+| `kb_preview_facts` | 预览单文档的事实提取结果（不写入） | 读 |
+| `kb_index` | 索引知识库（incremental / full / single / cleanup） | **写** |
+| `kb_canon` | 管理法典规则（查看/状态/导出/同步/解决冲突） | **写** |
 
-详见 `server.py` 中各工具的 docstring。
-
-## 配套 Slash 命令
-
-仓库的 `.claude/commands/` 下提供了与每个工具一一对应的 slash 命令，clone 后在 Claude Code 中可直接使用：
-
-```
-/kb_search <关键词>           — 搜索文档/事实
-/kb_list_modules             — 列出模块
-/kb_get_document <路径>       — 读取文档全文
-/kb_get_module_relations     — 模块关系图
-/kb_get_related_designs <模块> — 关联设计
-/kb_index [mode]             — 索引管理
-/kb_preview_facts <路径>      — 预览事实提取
-/kb_check <内容>              — 合规+一致性检查
-/kb_audit [模块]              — 跨文档矛盾审计
-/kb_canon [action]           — 法典管理
-/kb_overview [view]          — 概览（stats/changes/gaps）
-/kb_draft_assist <主题>       — 起草素材收集
-```
+> 只读使用者不要调用「写」类工具，也不要调用 `kb_overview view=gaps` / `kb_index mode=cleanup`——它们需要 `original_file/` 才能给出正确结果。
 
 ---
 
-## 目录结构
+## 维护者补充
+
+> 只读使用者可跳过本节。
+
+### 首次全量索引
+
+接入 MCP 后，让 Claude 调用 `kb_index` 工具（`mode="full"`），或者直接自然语言输入`全量建立索引`，做一次全量索引（耗时取决于文档量与 LLM 限流）。之后日常 `mode="incremental"` 即可。
+
+### 典型工作流
+
+- **新加入一批文档**：放入 `original_file/` → `kb_index mode=incremental`（会自动转 md 再索引）
+- **改单个文档后立刻生效**：`kb_index mode=single path=<文档路径>`
+- **固化团队约定**：`kb_canon` 添加/更新规则 → 之后所有 `kb_check` 自动校验
+- **`kb_audit` 报矛盾**：`kb_canon` 分类冲突 → 决策升级为法典 / 或回改文档
+
+---
+
+## 配套 Slash 命令（仅 Claude Code）
+
+仓库自带 `.claude/commands/`，与每个 MCP 工具一一对应。复制到项目根目录即可。
+
+其他 MCP 客户端（Cursor 等）不支持 slash 命令，直接用自然语言让模型调用工具即可。
+
+### 命令清单
+
+```
+/kb_search /kb_list_modules /kb_get_document /kb_get_module_relations
+/kb_get_related_designs /kb_overview /kb_check /kb_audit
+/kb_draft_assist /kb_preview_facts
+
+# 仅维护者
+/kb_index /kb_canon
+```
+
+> 想把这些命令全局可用？把 `.claude/commands/` 整个拷贝到 `~/.claude/commands/`（用户级），任意工作目录都能调用。
+
+---
+
+## 目录结构（代码）
 
 ```
 kb_yue/
@@ -137,28 +140,9 @@ kb_yue/
 ├─ module_aliases.py        ← 模块别名
 ├─ remap_paths.py           ← 路径重映射工具
 ├─ config.py                ← 配置加载
-├─ config.json.example      ← 配置示例（复制为 config.json）
-└─ .env.example             ← 环境变量示例（复制为 .env）
+├─ config.json.example      ← 配置示例
+└─ .env.example             ← 环境变量示例
 ```
-
----
-
-## 常见问题
-
-**Q：报错 `未找到 SILICONFLOW_API_KEY`？**
-A：确认 `.env` 文件已从 `.env.example` 复制并填好真实 key；`.env` 必须与 `server.py` 在同一目录。
-
-**Q：报错 `未配置知识库路径`？**
-A：确认 `.env` 文件已从 `.env.example` 复制，并填了 `KB_ROOT=<你的绝对路径>`。或者在 `config.json` 里设置 `kb_root`。
-
-**Q：JSON 配置中粘贴 Windows 路径报错？**
-A：JSON 不允许单反斜杠（`\t` `\n` 等会被当成转义符）。请改用 `.env` 配置（不需要转义），或在 JSON 里把 `\` 全部替换为 `/` 或 `\\`。
-
-**Q：索引很慢 / 经常超时？**
-A：首次全量索引会调用大量 LLM API，受网络和限流影响。可减小并发（修改 `config.py` 中 `LLM_API_SEMAPHORE` 的值）或分批处理。
-
-**Q：能否换其他向量 / LLM 提供商？**
-A：可以。修改 `config.py` 中 `get_siliconflow_client()` / `get_deepseek_client()` 的 `base_url` 与 key 即可，只要兼容 OpenAI 接口规范。
 
 ---
 

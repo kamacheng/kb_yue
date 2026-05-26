@@ -92,8 +92,13 @@ def _chunk_id(source: str, index: int) -> str:
 
 
 def _to_rel_path(p: Path) -> str:
-    """返回相对于 KB_DIR 的路径字符串；不在 KB_DIR 下时退回原始路径字符串。"""
-    return str(p.relative_to(KB_DIR)) if p.is_relative_to(KB_DIR) else str(p)
+    """返回相对于 KB_DIR 的路径字符串（统一 forward slash）；不在 KB_DIR 下时退回原始路径字符串。
+
+    所有进入 ChromaDB metadata / index_meta / facts store / canon 的 source key 必须经过本函数,
+    确保跨平台一致（Windows 反斜杠 / Unix 正斜杠 不再混用,避免 key 比对失配）。
+    """
+    raw = str(p.relative_to(KB_DIR)) if p.is_relative_to(KB_DIR) else str(p)
+    return raw.replace("\\", "/")
 
 
 # ---------- Facts Store ----------
@@ -216,7 +221,13 @@ def _canon_sync(extracted_facts: dict, trigger: str, timings: dict) -> dict:
 
     except Exception as e:
         timings["canon_sync"] = round(time.time() - t0, 2)
-        return {"canon_sync_error": str(e)}
+        return {
+            "canon_sync_error": str(e),
+            "canon_sync_hint": (
+                "法典同步失败但索引数据已保留。可执行 `kb_canon action=sync` 手动重试,"
+                "或 `kb_canon action=status` 查看当前法典状态。"
+            ),
+        }
 
 
 def _print_timing_summary(timings: dict):
@@ -287,7 +298,7 @@ def _sync_md_from_original() -> dict:
             rel = src.relative_to(ORIGINAL_DIR)
             dst = MD_DIR / rel
             src_stat = src.stat()
-            src_key = str(src.relative_to(KB_DIR))
+            src_key = _to_rel_path(src)
             cached = source_meta.get(src_key) or {}
 
             # 源签名未变 + dst 存在 → 跳过
@@ -444,20 +455,38 @@ def _batch_index_files(file_paths: list[str], skip_facts: bool = False) -> dict:
 
     # Phase 3+4: 嵌入向量 (SiliconFlow API) 和事实提取 (DeepSeek API) 并行执行
     def _do_embedding():
-        """Phase 3: 生成嵌入向量并写入 ChromaDB。"""
+        """Phase 3: 生成嵌入向量并写入 ChromaDB。失败时尝试逐批兜底,避免整批丢失。"""
         t_start = time.time()
         print(f"[INDEX] 开始生成嵌入向量 ({len(all_documents)} 个文本)...", file=sys.stderr)
-        embs = _embed_texts_cached(all_documents)
+        try:
+            embs = _embed_texts_cached(all_documents)
+        except Exception as e:
+            errors.append({"file": "<embedding>", "error": f"嵌入生成失败: {e}. 建议: 检查 SiliconFlow API key/网络,然后重跑 kb_index"})
+            print(f"[WARN] 嵌入生成失败,本轮无法写入向量: {e}", file=sys.stderr)
+            return round(time.time() - t_start, 2)
+
+        success_batches = 0
+        failed_batches = 0
         for i in range(0, len(all_ids), CHROMA_ADD_BATCH_SIZE):
             end = min(i + CHROMA_ADD_BATCH_SIZE, len(all_ids))
-            collection.add(
-                ids=all_ids[i:end],
-                embeddings=embs[i:end],
-                documents=all_documents[i:end],
-                metadatas=all_metadatas[i:end],
-            )
+            try:
+                collection.add(
+                    ids=all_ids[i:end],
+                    embeddings=embs[i:end],
+                    documents=all_documents[i:end],
+                    metadatas=all_metadatas[i:end],
+                )
+                success_batches += 1
+            except Exception as e:
+                failed_batches += 1
+                errors.append({"file": f"<chroma_batch_{i // CHROMA_ADD_BATCH_SIZE}>",
+                              "error": f"ChromaDB 写入失败: {e}. 建议: 检查磁盘空间/权限"})
+                print(f"[WARN] ChromaDB batch 写入失败 ({i}-{end}): {e}", file=sys.stderr)
         elapsed = round(time.time() - t_start, 2)
-        print(f"[INDEX] 向量索引写入完成", file=sys.stderr)
+        if failed_batches:
+            print(f"[WARN] 向量写入完成 (成功 {success_batches} 批, 失败 {failed_batches} 批)", file=sys.stderr)
+        else:
+            print(f"[INDEX] 向量索引写入完成", file=sys.stderr)
         return elapsed
 
     def _do_facts():
@@ -494,9 +523,13 @@ def _batch_index_files(file_paths: list[str], skip_facts: bool = False) -> dict:
         return facts_result, elapsed
 
     def _store_facts(extracted: dict[str, list]):
-        """收集所有文件事实后批量写入 FactsStore（单次内存去重 + 单次 upsert）。"""
+        """收集所有文件事实后批量写入 FactsStore（单次内存去重 + 单次 upsert）。
+
+        批量失败时 fallback 为 per-source 写入,确保单个文件出错不影响其他文件的事实。
+        """
         store = _get_facts_store()
         all_fact_items = []
+        per_source: dict[str, list] = {}
         for fpath, facts in extracted.items():
             if not facts:
                 continue
@@ -504,17 +537,32 @@ def _batch_index_files(file_paths: list[str], skip_facts: bool = False) -> dict:
             if fpath in file_texts:
                 _, chunks = file_texts[fpath]
                 module = chunks[0]["module"] if chunks else "未知"
+            per_source[fpath] = (module, facts)
             for f in facts:
                 all_fact_items.append({"fact": f, "source": fpath, "module": module})
 
-        if all_fact_items:
-            t0 = time.time()
+        if not all_fact_items:
+            return
+
+        t0 = time.time()
+        try:
+            count = store.add_facts_batch(all_fact_items, semantic_dedup=True)
+            elapsed = round(time.time() - t0, 2)
+            print(f"[INDEX] 事实批量写入: {count}/{len(all_fact_items)} 条, 耗时 {elapsed}s", file=sys.stderr)
+            return
+        except Exception as e:
+            print(f"[WARN] facts store 批量写入失败,改为 per-source 兜底: {e}", file=sys.stderr)
+
+        ok_sources = 0
+        for fpath, (module, facts) in per_source.items():
             try:
-                count = store.add_facts_batch(all_fact_items, semantic_dedup=True)
-                elapsed = round(time.time() - t0, 2)
-                print(f"[INDEX] 事实批量写入: {count}/{len(all_fact_items)} 条, 耗时 {elapsed}s", file=sys.stderr)
-            except Exception as e:
-                print(f"[WARN] facts store 批量写入失败: {e}", file=sys.stderr)
+                store.add_facts(facts, source=fpath, module=module)
+                ok_sources += 1
+            except Exception as e2:
+                errors.append({"file": fpath, "error": f"facts 写入失败(兜底亦失败): {e2}"})
+                print(f"[WARN] facts 写入失败 ({fpath}): {e2}", file=sys.stderr)
+        elapsed = round(time.time() - t0, 2)
+        print(f"[INDEX] 事实兜底写入: {ok_sources}/{len(per_source)} 源成功, 耗时 {elapsed}s", file=sys.stderr)
 
     extracted_facts: dict[str, list] = {}
     if skip_facts:
@@ -924,15 +972,15 @@ def incremental_rebuild(skip_facts: bool = False) -> dict:
     _invalidate_bm25()
     _invalidate_metadata_cache()
 
-    # 9. 自动清理孤儿（md_file 中无 original 源 / index_meta 中文件已删）
-    #    用户删除 original_file/ 中的源后，md_file/ 同步副本不会被 _sync_md_from_original 清理，
-    #    需要在此显式回收 chunks/facts/canon 规则。
+    # 9. 检测孤儿（md_file 中无 original 源 / index_meta 中文件已删）
+    #    历史行为是自动 destructive cleanup,容易因路径大小写/分隔符差异误删。
+    #    现改为 dry-run 检测,在 result 中提示用户运行 `kb_index mode=cleanup confirm=True` 显式清理。
     cleanup_result = None
     t0 = time.time()
     try:
-        cleanup_result = cleanup_orphans(dry_run=False)
+        cleanup_result = cleanup_orphans(dry_run=True)
     except Exception as e:
-        print(f"[WARN] 自动清理孤儿失败: {e}", file=sys.stderr)
+        print(f"[WARN] 孤儿检测失败: {e}", file=sys.stderr)
     timings["cleanup_orphans"] = round(time.time() - t0, 2)
 
     timings["total"] = round(time.time() - start_time, 2)
@@ -1022,7 +1070,7 @@ def rebuild_all(full: bool = True, skip_facts: bool = False, clear_canon: bool =
     # md_files 来自 MD_DIR.rglob，MD_DIR 是 KB_DIR 的子目录，relative_to 不会失败
     index_meta = {}
     for md_file in md_files:
-        index_meta[str(md_file.relative_to(KB_DIR))] = _file_signature(md_file)
+        index_meta[_to_rel_path(md_file)] = _file_signature(md_file)
     _save_index_meta(index_meta)
     _invalidate_bm25()
     _invalidate_metadata_cache()
@@ -1105,14 +1153,8 @@ def compute_processing_status() -> dict:
     # 1. 扫每个 original 源文件
     for src in _iter_original_sources():
         dst = _dst_md_for_source(src)
-        try:
-            src_rel = str(src.relative_to(KB_DIR))
-        except ValueError:
-            src_rel = str(src)
-        try:
-            dst_rel = str(dst.relative_to(KB_DIR))
-        except ValueError:
-            dst_rel = str(dst)
+        src_rel = _to_rel_path(src)
+        dst_rel = _to_rel_path(dst)
         seen_dst.add(dst_rel)
 
         try:
@@ -1156,7 +1198,7 @@ def compute_processing_status() -> dict:
         for md in MD_DIR.rglob("*.md"):
             if any(part in _EXCLUDED_DIR_NAMES for part in md.parts):
                 continue
-            md_rel = str(md.relative_to(KB_DIR))
+            md_rel = _to_rel_path(md)
             if md_rel in seen_dst:
                 continue
             indexed_info = index_meta.get(md_rel)

@@ -4,5 +4,11 @@
   "kb_root": "D:/你的知识库路径",
 
   "_comment_data_dir": "可选。索引数据目录。留空则默认 <kb_root>/.kb_index",
-  "data_dir": ""
+  "data_dir": "",
+
+  "_comment_md_dir": "可选。Markdown 文档目录（kb_get_document 的内容来源）。留空则默认 <kb_root>/md_file",
+  "md_dir": "",
+
+  "_comment_original_dir": "可选。原始文档目录（仅维护者建索引时使用）。留空则默认 <kb_root>/original_file",
+  "original_dir": ""
 }

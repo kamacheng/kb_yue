@@ -902,22 +902,41 @@ def filter_facts_for_canon(facts: list[DesignFact]) -> list[dict]:
 
 _CONFLICT_CLASSIFY_PROMPT = """你是法典冲突分析助手。判断以下规则冲突的类型并给出处理建议。
 
-冲突类型（必须从以下选其一）：
-- deprecated_old: 旧值反映被取代的过时设计
-- cross_doc_contradiction: 跨文档真矛盾（不同文档对同一事项给出不一致定义）
-- semantic_overlap: subject 相似但 predicate 含义实际不同（不应视为冲突）
-- format_variant: 表述形式差异但语义一致
-- uncategorized: 信息不足无法判断
+## 冲突类型（必须从以下选其一）
 
-处理建议（必须从以下选其一）：keep_new / keep_old / merge / manual
+- deprecated_old: 旧值反映被取代的过时设计（如旧版本数值/已下线机制）→ 建议 keep_new
+- cross_doc_contradiction: 跨文档真矛盾（不同文档对同一事项给出不一致定义,需要团队定夺）→ 建议 manual
+- semantic_overlap: subject 文字相似但 predicate 含义实际不同（不应视为冲突）→ 建议 manual
+- format_variant: 表述形式差异但语义完全一致（数值相同、单位相同、含义相同）→ 建议 merge
+- uncategorized: 信息不足无法判断 → 建议 manual
 
-冲突规则：
+## 关键边界判断
+
+**数值差异**: 即使一个用"约"一个用精确数,只要数值不同就是 cross_doc_contradiction（非 format_variant）
+  - 例: "上限15" vs "上限约15"  → cross_doc_contradiction（数值表达精度差异,真矛盾）
+  - 例: "上限15" vs "上限20"    → cross_doc_contradiction（明显矛盾）
+  - 例: "上限15" vs "上限为15"  → format_variant（仅措辞差异,语义一致）
+
+**单位差异**: 同一数量不同单位是 format_variant 还是 contradiction 取决于单位是否等价
+  - 例: "超时8秒" vs "超时8s"    → format_variant（单位等价）
+  - 例: "超时8秒" vs "超时8000ms" → format_variant（数量等价,单位等价）
+  - 例: "超时8秒" vs "超时10秒"  → cross_doc_contradiction（数量不等）
+
+**枚举差异**: 元素集合是否相同
+  - 例: "分为A/B/C" vs "分为A/B"           → cross_doc_contradiction（少元素,真矛盾）
+  - 例: "分为A/B/C" vs "包括A、B、C"       → format_variant（语义一致,仅措辞差异）
+  - 例: "状态: 已上线" vs "状态: 已发布"   → 倾向 semantic_overlap（同义需团队确认）
+
+**版本/年代证据**: 旧值出现在标注"v1"/"旧版"/"已废弃"的文档 → deprecated_old
+
+## 冲突规则
+
 - subject: {subject}
 - predicate: {predicate}
 - 旧值（来源 {old_source}）: {old_value}
 - 新值（来源 {new_source}）: {new_value}
 
-只输出 JSON，不要任何额外文字：
+只输出 JSON,不要任何额外文字:
 {{"category":"...","suggestion":"...","reasoning":"<50字以内>"}}
 """
 

@@ -62,10 +62,15 @@ def _full_check(content: str, store: FactsStore, module: str | None) -> dict:
     try:
         new_facts = extract_facts(content)
     except Exception as e:
-        return {"status": "error", "message": f"事实提取失败: {e}"}
+        return {"status": "error", "checked": False, "message": f"事实提取失败: {e}"}
 
     if not new_facts:
-        return {"status": "no_facts", "message": "未从新内容中提取到设计事实，无法进行矛盾检查"}
+        return {
+            "status": "check_skipped",
+            "checked": False,
+            "reason": "未从新内容中提取到设计事实（可能内容太短/全是 UI 描述）",
+            "message": "无法进行矛盾检查,请检查内容是否包含具体的约束/规则/枚举",
+        }
 
     related_facts = []
     searched_subjects = set()
@@ -86,7 +91,14 @@ def _full_check(content: str, store: FactsStore, module: str | None) -> dict:
             unique_related.append(f)
 
     if not unique_related:
-        return {"status": "no_conflicts", "conflicts": [], "related_designs": [], "suggestions": "未找到相关已有事实，无法判断是否存在矛盾"}
+        return {
+            "status": "check_skipped",
+            "checked": False,
+            "conflicts": [],
+            "related_designs": [],
+            "reason": "事实库中未找到相关已有事实",
+            "suggestions": "新内容涉及全新主题,无法做一致性比对；建议正式索引后再次 audit",
+        }
 
     try:
         client = get_deepseek_client()
@@ -105,6 +117,7 @@ def _full_check(content: str, store: FactsStore, module: str | None) -> dict:
         result = json.loads(result_text)
         sources = set(f.get("source", "") for f in unique_related if f.get("source"))
         result["related_designs"] = sorted(sources)
+        result["checked"] = True
         return result
     except Exception as e:
         print(f"[WARN] 矛盾对比失败: {e}", file=sys.stderr)
@@ -121,11 +134,18 @@ def compliance_check(
     try:
         new_facts = extract_facts(content)
     except Exception as e:
-        return {"status": "error", "message": f"事实提取失败: {e}"}
+        return {"status": "error", "checked": False, "message": f"事实提取失败: {e}"}
 
     if not new_facts:
-        return {"canon_violations": [], "fact_conflicts": [],
-                "passed_rules": 0, "suggestions": "未提取到事实"}
+        return {
+            "status": "check_skipped",
+            "checked": False,
+            "canon_violations": [],
+            "fact_conflicts": [],
+            "passed_rules": 0,
+            "reason": "未从内容中提取到事实",
+            "suggestions": "无法做合规检查；请确认内容包含具体的数值约束/规则,或扩展内容长度",
+        }
 
     violations = []
     passed = 0
@@ -158,6 +178,8 @@ def compliance_check(
             f"- {v['rule']}: 你的值={v['your_value']}" for v in violations)
 
     return {
+        "status": "conflicts_found" if (violations or fact_conflicts) else "ok",
+        "checked": True,
         "canon_violations": violations,
         "fact_conflicts": fact_conflicts,
         "passed_rules": passed,
@@ -233,18 +255,38 @@ def audit_facts(
     if not all_facts:
         return {"status": "empty", "message": "事实存储为空，请先索引文档"}
 
-    # 2. 按 subject 分组
+    # 2. 按归一化 subject 分组(去空格/标点),避免"VIP 等级"与"VIP等级"被当作两组
+    import re as _re
     from collections import defaultdict
+
+    def _normalize(s: str) -> str:
+        if not s:
+            return ""
+        return _re.sub(r'[\s，。、：:]+', '', s.strip()).lower()
+
     groups: dict[str, list[dict]] = defaultdict(list)
     for fact in all_facts:
-        groups[fact.get("subject", "unknown")].append(fact)
+        groups[_normalize(fact.get("subject", "unknown"))].append(fact)
 
-    # 3. 找出同 subject 但不同 source 的事实组
+    # 3. 同组内进一步按 (predicate, value) 归一化去重,
+    #    确保"上限15" 与 "上限 15" 不被当作两条独立事实进入比对
+    def _fact_key(f: dict) -> tuple:
+        return (_normalize(f.get("predicate", "")), _normalize(f.get("value", "")))
+
     candidates = []
-    for subject, facts in groups.items():
-        sources = set(f.get("source", "") for f in facts)
+    for subject_norm, facts in groups.items():
+        seen: dict[tuple, dict] = {}
+        for f in facts:
+            k = _fact_key(f)
+            # 同 (pred, value) 归一后只保留 confidence 最高的代表
+            if k not in seen or float(f.get("confidence", 0)) > float(seen[k].get("confidence", 0)):
+                seen[k] = f
+        unique_facts = list(seen.values())
+        sources = set(f.get("source", "") for f in unique_facts)
         if len(sources) > 1:
-            candidates.append((subject, facts))
+            # 用原始 subject 作展示名(取首条事实的)
+            display_subject = unique_facts[0].get("subject", subject_norm)
+            candidates.append((display_subject, unique_facts))
 
     if not candidates:
         return {"status": "no_duplicates", "message": "未发现同主题跨文档的事实，无需审计"}

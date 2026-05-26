@@ -48,7 +48,10 @@ def _resolve_kb_root(kb_root: str, config_path: Path) -> str:
 
 
 def _load_config() -> dict:
-    """加载配置：优先 config.json，其次环境变量，否则报错提示。"""
+    """加载配置：优先 config.json，其次环境变量，否则报错提示。
+
+    只需配置 KB_ROOT,其余子路径(.kb_index / md_file / original_file)从根目录派生。
+    """
     config_path = Path(__file__).parent / "config.json"
     config = {}
     if config_path.exists():
@@ -61,39 +64,102 @@ def _load_config() -> dict:
     kb_root = kb_root_from_config or get_env("KB_ROOT")
     if not kb_root:
         raise RuntimeError(
-            "未配置知识库路径。请在 .env 文件中设置 KB_ROOT，"
+            "未配置知识库路径。请在 .env 文件中设置 KB_ROOT,"
             "或在 config.json 中设置 kb_root。详见 README。"
         )
 
-    # 若 kb_root 来自 config.json 且为相对路径，相对于 config.json 目录解析
-    # （环境变量中的相对路径语义不明确，不做处理）
+    # 若 kb_root 来自 config.json 且为相对路径,相对于 config.json 目录解析
+    # （环境变量中的相对路径语义不明确,不做处理）
     if kb_root_from_config:
         kb_root = _resolve_kb_root(kb_root, config_path)
 
-    data_dir = config.get("data_dir") or get_env("KB_DATA_DIR")
-    if not data_dir or data_dir.startswith("可选"):
-        data_dir = str(Path(kb_root) / ".kb_index")
-
-    return {"kb_root": kb_root, "data_dir": data_dir}
+    kb_root_path = Path(kb_root)
+    return {
+        "kb_root": kb_root,
+        "data_dir": str(kb_root_path / ".kb_index"),
+        "md_dir": str(kb_root_path / "md_file"),
+        "original_dir": str(kb_root_path / "original_file"),
+    }
 
 
 _config = _load_config()
 
 # ---------- 路径常量 ----------
 
-KB_DIR = Path(_config["kb_root"])
-DATA_DIR = Path(_config["data_dir"])
-CHROMA_DIR = DATA_DIR / "chroma_data"
-INDEX_META_PATH = DATA_DIR / "index_meta.json"
-SOURCE_META_PATH = DATA_DIR / "source_meta.json"
-FACTS_CACHE_DIR = DATA_DIR / "cache" / "facts"
-AI_FORMAT_CACHE_DIR = DATA_DIR / "cache" / "ai_format"
-ORIGINAL_DIR = KB_DIR / "original_file"
-MD_DIR = KB_DIR / "md_file"
-CONVERTED_XLSX_DIR = KB_DIR / "_converted_xlsx"  # 兼容旧路径，新流程使用 MD_DIR
-CANON_PATH = DATA_DIR / "canon.json"
-CANON_CHANGELOG_PATH = DATA_DIR / "canon_changelog.json"
-CANON_LOCK_PATH = DATA_DIR / "canon.lock"
+def _recompute_paths() -> None:
+    """根据当前 _config 重新计算所有路径常量（写入本模块 globals）。"""
+    g = globals()
+    kb_dir = Path(_config["kb_root"])
+    data_dir = Path(_config["data_dir"])
+    g["KB_DIR"] = kb_dir
+    g["DATA_DIR"] = data_dir
+    g["CHROMA_DIR"] = data_dir / "chroma_data"
+    g["INDEX_META_PATH"] = data_dir / "index_meta.json"
+    g["SOURCE_META_PATH"] = data_dir / "source_meta.json"
+    g["FACTS_CACHE_DIR"] = data_dir / "cache" / "facts"
+    g["AI_FORMAT_CACHE_DIR"] = data_dir / "cache" / "ai_format"
+    g["ORIGINAL_DIR"] = Path(_config["original_dir"])
+    g["MD_DIR"] = Path(_config["md_dir"])
+    g["CONVERTED_XLSX_DIR"] = kb_dir / "_converted_xlsx"
+    g["CANON_PATH"] = data_dir / "canon.json"
+    g["CANON_CHANGELOG_PATH"] = data_dir / "canon_changelog.json"
+    g["CANON_LOCK_PATH"] = data_dir / "canon.lock"
+
+
+_recompute_paths()
+
+
+# 已知会通过 `from config import X` 缓存路径常量的下游模块及其引用的名字。
+# reload_config() 会把最新值 setattr 回这些模块，确保 .env 改动在运行时生效。
+_PATH_CONSUMERS: dict[str, tuple[str, ...]] = {
+    "index_manager": (
+        "KB_DIR", "DATA_DIR", "CHROMA_DIR", "INDEX_META_PATH", "SOURCE_META_PATH",
+        "ORIGINAL_DIR", "MD_DIR",
+    ),
+    "indexer": ("KB_DIR", "DATA_DIR", "MD_DIR", "ORIGINAL_DIR"),
+    "canon_manager": ("CANON_PATH", "CANON_CHANGELOG_PATH", "CANON_LOCK_PATH", "DATA_DIR"),
+    "ai_formatter": ("AI_FORMAT_CACHE_DIR",),
+    "fact_extractor": ("FACTS_CACHE_DIR",),
+}
+
+
+def reload_config() -> dict:
+    """重新读取 .env 与 config.json,刷新所有路径常量并推送给已加载的下游模块。
+
+    供 kb_index 等写入工具在执行前调用,确保用户修改 .env 后无需重启 MCP server。
+
+    Returns:
+        新的配置字典(kb_root/data_dir/md_dir/original_dir)。
+    """
+    import sys
+
+    global _env_loaded, _env_values, _config
+    _env_loaded = False
+    _env_values = {}
+    _config = _load_config()
+    _recompute_paths()
+
+    g = globals()
+    for mod_name, attrs in _PATH_CONSUMERS.items():
+        mod = sys.modules.get(mod_name)
+        if mod is None:
+            continue
+        for attr in attrs:
+            if attr in g:
+                setattr(mod, attr, g[attr])
+
+    # xlsx_converter.CONVERTED_DIR 在 index_manager.py 模块加载时绑定到 MD_DIR,
+    # 同步更新它,否则转换器会写到旧路径。
+    xc = sys.modules.get("xlsx_converter")
+    if xc is not None:
+        xc.CONVERTED_DIR = g["MD_DIR"]
+
+    # 重置 index_manager 中持有路径的单例(facts_store 用 CHROMA_DIR 初始化)。
+    im = sys.modules.get("index_manager")
+    if im is not None and hasattr(im, "_facts_store"):
+        im._facts_store = None
+
+    return dict(_config)
 
 # ---------- API 配置 ----------
 
@@ -114,7 +180,12 @@ USE_RERANKER = True
 # ---------- LLM 并发控制 ----------
 
 import threading
-LLM_API_SEMAPHORE = threading.Semaphore(12)
+# 信号量从 12 降到 8: 减少 API 限流压力,单个请求卡住时阻塞面更小
+LLM_API_SEMAPHORE = threading.Semaphore(8)
+
+# OpenAI client 超时/重试配置
+LLM_REQUEST_TIMEOUT = 30.0  # 单次请求超时(秒)
+LLM_MAX_RETRIES = 2         # SDK 内置重试次数(指数退避)
 
 # ---------- API 客户端工厂 ----------
 
@@ -134,7 +205,12 @@ def get_siliconflow_client():
     if not api_key:
         raise ValueError("未找到 SILICONFLOW_API_KEY，请在 .env 文件或环境变量中设置")
 
-    _siliconflow_client = OpenAI(base_url=EMBEDDING_API_BASE, api_key=api_key)
+    _siliconflow_client = OpenAI(
+        base_url=EMBEDDING_API_BASE,
+        api_key=api_key,
+        timeout=LLM_REQUEST_TIMEOUT,
+        max_retries=LLM_MAX_RETRIES,
+    )
     return _siliconflow_client
 
 
@@ -150,5 +226,10 @@ def get_deepseek_client():
     if not api_key:
         raise ValueError("未找到 DEEPSEEK_API_KEY，请在 .env 文件或环境变量中设置")
 
-    _deepseek_client = OpenAI(base_url="https://api.deepseek.com", api_key=api_key)
+    _deepseek_client = OpenAI(
+        base_url="https://api.deepseek.com",
+        api_key=api_key,
+        timeout=LLM_REQUEST_TIMEOUT,
+        max_retries=LLM_MAX_RETRIES,
+    )
     return _deepseek_client

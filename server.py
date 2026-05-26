@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from indexer import (
     search, list_modules, get_module_relations, index_single,
-    rebuild_all, incremental_rebuild, KB_DIR, _invalidate_bm25,
+    rebuild_all, incremental_rebuild, KB_DIR, MD_DIR, _invalidate_bm25,
     _get_facts_store, get_recent_changes, compute_processing_status,
     cleanup_orphans,
 )
@@ -62,6 +62,27 @@ def _short_path(path: str) -> str:
         return p.name
     except Exception:
         return path
+
+
+def _resolve_md_path(path: str) -> Path:
+    """把用户传入的文档路径解析成绝对路径。
+
+    解析顺序:
+    1. 已是绝对路径 → 原样返回
+    2. KB_DIR / path（兼容存储 key 形如 "md_file/foo.md"）
+    3. MD_DIR / path（兼容相对 md_file 的路径如 "foo.md"）
+
+    返回第一个存在的；都不存在则返回 MD_DIR / path 用于错误信息。
+    """
+    p = Path(path)
+    if p.is_absolute():
+        return p
+    norm = path.replace("\\", "/")
+    candidates = [KB_DIR / norm, MD_DIR / norm]
+    for cand in candidates:
+        if cand.exists():
+            return cand
+    return candidates[-1]
 
 
 def _get_conflict_context(rule: dict, max_chars: int = 200) -> str | None:
@@ -218,7 +239,9 @@ def _fmt_index_result(mode: str, result: dict) -> str:
     """格式化索引结果。"""
     status = result.get("status", "unknown")
     if status == "error":
-        return f"索引失败: {result.get('message', '未知错误')}"
+        msg = result.get("message", "未知错误")
+        hint = "建议: 1) 检查 KB_ROOT 路径是否存在 2) 确认 .env 中 API key 有效 3) 查看上方 stderr 日志定位具体阶段"
+        return f"索引失败: {msg}\n{hint}"
 
     lines = []
     mode_labels = {"full": "全量重建", "incremental": "增量更新", "single": "单文件索引"}
@@ -250,18 +273,20 @@ def _fmt_index_result(mode: str, result: dict) -> str:
                       f"冲突{canon.get('conflicts_detected', 0)}条, "
                       f"过滤{canon.get('skipped_low_value', 0)}条低价值")
 
-    # 孤儿清理（增量更新时自动执行）
+    # 孤儿检测（增量/全量索引后,dry-run 检测,提示用户显式清理）
     cleanup = result.get("cleanup")
-    if cleanup and (cleanup.get("deleted_files") or cleanup.get("deleted_chunks")
-                    or cleanup.get("deleted_facts") or cleanup.get("deprecated_rules")):
-        lines.append(f"  孤儿清理: 文件{cleanup.get('deleted_files', 0)}个, "
-                      f"chunks{cleanup.get('deleted_chunks', 0)}, "
-                      f"facts{cleanup.get('deleted_facts', 0)}, "
-                      f"废弃规则{cleanup.get('deprecated_rules', 0)}")
-        for it in cleanup.get("orphan_md", [])[:5]:
-            lines.append(f"    - {it.get('dst', '?')}")
-        for it in cleanup.get("orphan_index", [])[:5]:
-            lines.append(f"    - {it.get('dst', '?')} (索引孤儿)")
+    if cleanup:
+        orphan_md = cleanup.get("orphan_md", [])
+        orphan_index = cleanup.get("orphan_index", [])
+        if orphan_md or orphan_index:
+            lines.append(f"  孤儿检测(dry-run): md孤儿{len(orphan_md)}个, 索引孤儿{len(orphan_index)}个")
+            for it in orphan_md[:5]:
+                lines.append(f"    - {it.get('dst', '?')} (md_file 中无 original 源)")
+            for it in orphan_index[:5]:
+                lines.append(f"    - {it.get('dst', '?')} (文件已删,索引残留)")
+            if len(orphan_md) + len(orphan_index) > 5:
+                lines.append(f"    ... 还有 {len(orphan_md) + len(orphan_index) - 5} 项")
+            lines.append("  → 确认无误后执行: kb_index mode=cleanup confirm=True")
 
     # 计时
     timings = result.get("timings")
@@ -277,12 +302,21 @@ def _fmt_index_result(mode: str, result: dict) -> str:
         if detail_parts:
             lines.append(f"  明细: {' | '.join(detail_parts)}")
 
+    # 法典同步失败提示
+    if result.get("canon_sync_error"):
+        lines.append(f"  ⚠ 法典同步失败: {result['canon_sync_error']}")
+        if result.get("canon_sync_hint"):
+            lines.append(f"     → {result['canon_sync_hint']}")
+
     # 错误
     errs = result.get("errors", [])
     if errs:
         lines.append(f"  错误: {len(errs)}个")
         for e in errs[:3]:
             lines.append(f"    - {e.get('file', '?')}: {e.get('error', '?')}")
+        if len(errs) > 3:
+            lines.append(f"    ... 还有 {len(errs) - 3} 条")
+        lines.append("  → 修复后可重跑相同模式(incremental 会跳过已成功文件)")
 
     return "\n".join(lines)
 
@@ -541,16 +575,27 @@ def _fmt_overview_gaps(data: dict, filter_name: str | None = None, sample: int =
 def _fmt_check_result(data: dict) -> str:
     """格式化设计检查结果。"""
     status = data.get("status", "ok")
-    mode = data.get("mode", "")
-    status_icon = {"ok": "✓", "conflicts_found": "✗", "warnings_found": "⚠"}.get(status, "?")
+    status_icon = {
+        "ok": "✓", "conflicts_found": "✗", "warnings_found": "⚠",
+        "check_skipped": "⊘", "no_conflicts": "✓", "error": "✗",
+    }.get(status, "?")
 
     lines = [f"检查结果: {status_icon} {status}"]
+
+    # 顶层 checked=False 显示跳过原因
+    if data.get("checked") is False:
+        reason = data.get("reason") or data.get("message", "")
+        if reason:
+            lines.append(f"  ⊘ 未实际检查: {reason}")
 
     # compliance 部分
     comp = data.get("compliance", {})
     if comp:
         c_status = comp.get("status", "ok")
-        lines.append(f"\n  法典合规: {c_status}")
+        c_checked = comp.get("checked", True)
+        lines.append(f"\n  法典合规: {c_status}{' (跳过)' if not c_checked else ''}")
+        if not c_checked and comp.get("reason"):
+            lines.append(f"    ⊘ {comp['reason']}")
         for v in comp.get("violations", [])[:5]:
             lines.append(f"    - 违反: {v.get('rule', '?')}")
             lines.append(f"      详情: {v.get('detail', '?')}")
@@ -559,7 +604,10 @@ def _fmt_check_result(data: dict) -> str:
     cons = data.get("consistency", {})
     if cons:
         c_status = cons.get("status", "ok")
-        lines.append(f"\n  事实一致性: {c_status}")
+        c_checked = cons.get("checked", True)
+        lines.append(f"\n  事实一致性: {c_status}{' (跳过)' if not c_checked else ''}")
+        if not c_checked and cons.get("reason"):
+            lines.append(f"    ⊘ {cons['reason']}")
         for c in cons.get("conflicts", [])[:5]:
             lines.append(f"    - 冲突: {c.get('description', '?')}")
             if c.get("existing"):
@@ -803,11 +851,7 @@ def get_document(path: str) -> str:
     Returns:
         文档全文内容，或错误信息
     """
-    p = Path(path)
-    if not p.is_absolute():
-        p = KB_DIR / p
-        if not p.exists():
-            p = KB_DIR / "md_file" / path
+    p = _resolve_md_path(path)
 
     if not p.exists():
         return f"错误: 文件不存在 - {p}"
@@ -853,14 +897,14 @@ def kb_index_tool(
     Returns:
         索引结果
     """
+    # 写入类工具调用前重读 .env,避免 MCP server 启动后 .env 被修改导致路径失效。
+    from config import reload_config
+    reload_config()
+
     if mode == "single":
         if not path:
             return "错误: mode='single' 需要提供 path 参数"
-        p = Path(path)
-        if not p.is_absolute():
-            p = KB_DIR / p
-            if not p.exists():
-                p = KB_DIR / "md_file" / path
+        p = _resolve_md_path(path)
         result = index_single(str(p))
     elif mode == "full":
         result = rebuild_all(full=True, skip_facts=skip_facts, clear_canon=clear_canon)
@@ -897,11 +941,7 @@ def kb_preview_facts_tool(path: str) -> str:
     from doc_parser import parse_document
     from fact_extractor import extract_facts_from_chunks
 
-    p = Path(path)
-    if not p.is_absolute():
-        p = KB_DIR / p
-        if not p.exists():
-            p = KB_DIR / "md_file" / path
+    p = _resolve_md_path(path)
 
     if not p.exists():
         return f"错误: 文件不存在 - {p}"
@@ -1069,19 +1109,31 @@ def kb_check_tool(
         results["consistency"] = consistency_result
 
     # full mode: merge results
+    comp = results.get("compliance", {})
+    cons = results.get("consistency", {})
     merged = {
         "mode": "full",
-        "compliance": results.get("compliance", {}),
-        "consistency": results.get("consistency", {}),
+        "compliance": comp,
+        "consistency": cons,
     }
-    c_status = results.get("compliance", {}).get("status", "ok")
-    f_status = results.get("consistency", {}).get("status", "ok")
+    c_status = comp.get("status", "ok")
+    f_status = cons.get("status", "ok")
+    c_checked = comp.get("checked", True)
+    f_checked = cons.get("checked", True)
+
     if "conflict" in c_status or "conflict" in f_status:
         merged["status"] = "conflicts_found"
+        merged["checked"] = c_checked or f_checked
     elif "warning" in c_status or "warning" in f_status:
         merged["status"] = "warnings_found"
+        merged["checked"] = c_checked or f_checked
+    elif not c_checked and not f_checked:
+        merged["status"] = "check_skipped"
+        merged["checked"] = False
+        merged["reason"] = comp.get("reason") or cons.get("reason", "")
     else:
         merged["status"] = "ok"
+        merged["checked"] = c_checked or f_checked
 
     return _fmt_check_result(merged)
 

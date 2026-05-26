@@ -139,11 +139,14 @@ def _bm25_search(query: str, top_k: int) -> dict[str, float]:
 
 # ---------- 查询重写 ----------
 
+_REWRITE_MAX_LEN = 200  # 重写后查询长度上限,防止 LLM 漂移导致过长查询
+
+
 def _rewrite_query(query: str) -> str:
     """用 LLM 将查询扩展为同义词组，提升召回。
 
     使用 config.get_deepseek_client() 获取 DeepSeek API 客户端。
-    失败时静默返回原始查询。
+    失败或超长时静默返回原始查询。
     """
     try:
         client = get_deepseek_client()
@@ -152,9 +155,9 @@ def _rewrite_query(query: str) -> str:
             model="deepseek-chat",
             messages=[
                 {"role": "system", "content": (
-                    "你是搜索查询扩展助手。将用户的查询扩展为包含同义词和相关术语的版本，"
-                    "用于在游戏设计知识库中检索文档。直接返回扩展后的查询文本，不要解释。"
-                    "保持简洁，不超过50字。"
+                    "你是搜索查询扩展助手。将用户的查询扩展为包含同义词和相关术语的版本,"
+                    "用于在游戏设计知识库中检索文档。直接返回扩展后的查询文本,不要解释。"
+                    "保持简洁,不超过50字。"
                 )},
                 {"role": "user", "content": query},
             ],
@@ -162,10 +165,20 @@ def _rewrite_query(query: str) -> str:
             max_tokens=100,
         )
         rewritten = response.choices[0].message.content.strip()
-        if rewritten:
-            return rewritten
+        if not rewritten:
+            return query
+        # 长度兜底: 防止 LLM 偶发输出超长内容导致向量嵌入失败或召回漂移
+        if len(rewritten) > _REWRITE_MAX_LEN:
+            print(
+                f"[WARN] 查询重写超长 ({len(rewritten)} > {_REWRITE_MAX_LEN}),截断保留前缀。"
+                f" 原始: {query!r}",
+                file=sys.stderr,
+            )
+            rewritten = rewritten[:_REWRITE_MAX_LEN]
+        print(f"[INFO] 查询重写: {query!r} → {rewritten!r}", file=sys.stderr)
+        return rewritten
     except Exception as e:
-        print(f"[WARN] 查询重写失败 ({e})，使用原始查询", file=sys.stderr)
+        print(f"[WARN] 查询重写失败 ({e}),使用原始查询: {query!r}", file=sys.stderr)
 
     return query
 
@@ -519,7 +532,13 @@ def _single_query_search(
         if cid not in vector_data:
             vector_data[cid] = data
 
-    # 混合评分
+    # 混合评分: 线性加权融合
+    #   final = v_weight * normalized_vector_score + b_weight * normalized_bm25_score
+    # 两侧分数均已归一化到 [0, 1]:
+    #   - vector_score = 1 - distance/2   (ChromaDB cosine distance ∈ [0, 2])
+    #   - bm25_score   = score / max_score (在 _bm25_search 内做 max 归一化)
+    # 权重由查询类型决定(_PRECISE: 0.5/0.5, EXPLORE: 0.8/0.2, RELATION: 默认 VECTOR_WEIGHT/BM25_WEIGHT)。
+    # 注意: 这里是线性加权,不是 RRF。如果改用 RRF,请删除 weight 配置避免误导。
     all_ids = set(vector_scores.keys()) | set(bm25_scores.keys())
     combined: list[dict] = []
 

@@ -5,7 +5,7 @@
 """
 
 # 配置
-from config import KB_DIR, DATA_DIR
+from config import KB_DIR, DATA_DIR, MD_DIR, ORIGINAL_DIR
 
 # 搜索
 from search_engine import search, _invalidate_bm25

@@ -151,9 +151,16 @@ def convert_all_xlsx(kb_dir: str, force: bool = False) -> dict:
         {"converted": [...md路径], "skipped": [...md路径], "errors": [...]}
     """
     kb_path = Path(kb_dir)
-    # 优先从 original_file/ 扫描，兼容旧结构（根目录）
-    original_dir = kb_path / "original_file"
-    scan_dir = original_dir if original_dir.exists() else kb_path
+    # 优先用配置后的 ORIGINAL_DIR（可独立于 KB_ROOT），其次 kb_path/original_file，最后退回 kb_path
+    try:
+        from config import ORIGINAL_DIR as _CFG_ORIGINAL
+    except ImportError:
+        _CFG_ORIGINAL = None
+    if _CFG_ORIGINAL and Path(_CFG_ORIGINAL).exists():
+        scan_dir = Path(_CFG_ORIGINAL)
+    else:
+        original_dir = kb_path / "original_file"
+        scan_dir = original_dir if original_dir.exists() else kb_path
     xlsx_files = [f for ext in ("*.xlsx", "*.xlsm") for f in scan_dir.rglob(ext)]
 
     converted: list[str] = []
